@@ -9,7 +9,8 @@ import fastf1
 import numpy as np
 import pandas as pd
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
+import kafka.errors as kafka_errors
+from kafka import KafkaProducer
 
 # Konfigurasi Logging
 logging.basicConfig(
@@ -46,9 +47,9 @@ def create_kafka_producer(servers: str, retries: int = 10, delay: int = 3) -> Ka
             )
             logger.info(f"Berhasil terhubung ke Kafka Broker di {servers}")
             return producer
-        except NoBrokersAvailable:
+        except (kafka_errors.NoBrokersAvailable, kafka_errors.KafkaError, Exception) as e:
             logger.warning(
-                f"Kafka belum siap (percobaan {attempt}/{retries}). Menunggu {delay} detik..."
+                f"Kafka belum siap ({e}) - percobaan {attempt}/{retries}. Menunggu {delay} detik..."
             )
             time.sleep(delay)
     raise RuntimeError(f"Gagal terhubung ke Kafka di {servers} setelah {retries} percobaan.")
