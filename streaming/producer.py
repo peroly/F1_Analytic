@@ -1,196 +1,180 @@
 import json
 import logging
-import math
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
 import fastf1
-import numpy as np
 import pandas as pd
-from kafka import KafkaProducer
-import kafka.errors as kafka_errors
-from kafka import KafkaProducer
+from kafka import KafkaConsumer, KafkaProducer
 
-# Konfigurasi Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("F1-Kafka-Producer")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("F1-Producer")
 
-# Konfigurasi Environment 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "f1-telemetry-live")
-CACHE_DIR = os.getenv("FASTF1_CACHE_DIR", "./cache")
+KAFKA_CONTROL_TOPIC = os.getenv("KAFKA_CONTROL_TOPIC", "f1-stream-control")
+STREAM_DELAY = float(os.getenv("STREAM_DELAY", "0.3"))
 
-# Parameter Balapan F1 yang Disimulasikan
-F1_YEAR = int(os.getenv("F1_YEAR", "2024"))
-F1_GP = os.getenv("F1_GP", "Monza")          
-F1_SESSION = os.getenv("F1_SESSION", "R")    
-DRIVERS = os.getenv("F1_DRIVERS", "VER,LEC").split(",")  
-MAX_LAPS = int(os.getenv("F1_MAX_LAPS", "5"))  
-STREAM_DELAY = float(os.getenv("STREAM_DELAY", "0.2"))  # Jeda antar data (detik)
+os.makedirs("./cache", exist_ok=True)
+fastf1.Cache.enable_cache("./cache")
+
+# State konfigurasi aktif (di-update otomatis oleh listener Kafka control topic)
+active_config = {
+    "filtered_year": int(os.getenv("F1_YEAR", "2024")),
+    "grand_prix": os.getenv("F1_GP", "Monza"),
+    "session": os.getenv("F1_SESSION", "R"),
+    "drivers": None,  # None = ambil semua pembalap; atau list seperti ["VER", "LEC"]
+    "max_laps": int(os.getenv("MAX_LAPS", "5")),
+}
+config_lock = threading.Lock()
+reload_event = threading.Event()
 
 
-def create_kafka_producer(servers: str, retries: int = 10, delay: int = 3) -> KafkaProducer:
-    """Membuat koneksi KafkaProducer dengan mekanisme retry jika container Kafka baru menyala."""
-    for attempt in range(1, retries + 1):
-        try:
-            producer = KafkaProducer(
-                bootstrap_servers=servers.split(","),
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-                key_serializer=lambda k: k.encode("utf-8") if k else None,
-                acks="all",
-                retries=3,
-            )
-            logger.info(f"Berhasil terhubung ke Kafka Broker di {servers}")
-            return producer
-        except (kafka_errors.NoBrokersAvailable, kafka_errors.KafkaError, Exception) as e:
-            logger.warning(
-                f"Kafka belum siap ({e}) - percobaan {attempt}/{retries}. Menunggu {delay} detik..."
-            )
-            time.sleep(delay)
-    raise RuntimeError(f"Gagal terhubung ke Kafka di {servers} setelah {retries} percobaan.")
+def listen_stream_control():
+    """Thread latar belakang untuk menangkap perubahan filter dari FastAPI/Frontend."""
+    consumer = KafkaConsumer(
+        KAFKA_CONTROL_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        group_id="f1-producer-control-group",
+        auto_offset_reset="latest",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    )
+    logger.info(f"Mendengarkan perintah filter dinamis di topik '{KAFKA_CONTROL_TOPIC}'...")
+
+    for msg in consumer:
+        new_cfg = msg.value
+        if not isinstance(new_cfg, dict):
+            continue
+        with config_lock:
+            active_config["filtered_year"] = int(new_cfg.get("filtered_year", active_config["filtered_year"]))
+            active_config["grand_prix"] = str(new_cfg.get("grand_prix", active_config["grand_prix"]))
+            active_config["session"] = str(new_cfg.get("session", active_config["session"])).upper()
+            raw_drivers = new_cfg.get("drivers")
+            active_config["drivers"] = [d.strip().upper() for d in raw_drivers] if raw_drivers else None
+            active_config["max_laps"] = int(new_cfg.get("max_laps") or 5)
+
+        logger.info(f"Filter baru diterima dari Frontend: {active_config}. Memuat ulang sesi...")
+        reload_event.set()
 
 
 def sanitize_value(val):
-    """Mengonversi tipe data NumPy/Pandas serta menangani NaN/NaT agar 100% valid JSON."""
-    if val is None or (isinstance(val, float) and math.isnan(val)) or pd.isna(val):
+    if pd.isna(val):
         return None
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return round(float(val), 4)
-    if isinstance(val, (np.bool_, bool)):
-        return bool(val)
-    if isinstance(val, pd.Timedelta):
-        return round(val.total_seconds(), 4)
-    if isinstance(val, (pd.Timestamp, datetime)):
-        return val.isoformat()
-    return val
+    return val.item() if hasattr(val, "item") else val
 
 
-def extract_race_telemetry(year: int, gp: str, session_type: str, drivers: list[str], max_laps: int) -> pd.DataFrame:
-    """Mengunduh dan menyiapkan dataframe telemetri kronologis dari FastF1."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    fastf1.Cache.enable_cache(CACHE_DIR)
+def extract_race_telemetry(year: int, grand_prix: str, session_type: str, drivers: list[str] | None, max_laps: int):
+    logger.info(f"Memuat sesi FastF1: {year} {grand_prix} ({session_type})...")
+    session = fastf1.get_session(year, grand_prix, session_type)
+    session.load(telemetry=True, laps=True, weather=False, messages=False)
 
-    logger.info(f"Memuat sesi FastF1: {year} {gp} ({session_type})...")
-    session = fastf1.get_session(year, gp, session_type)
-    session.load(telemetry=True, laps=True, weather=False)
+    # Jika drivers=None/kosong, ambil seluruh pembalap yang turun pada sesi tersebut
+    if not drivers:
+        target_drivers = [
+            session.get_driver(drv_num)["Abbreviation"]
+            for drv_num in session.drivers
+            if session.get_driver(drv_num)["Abbreviation"]
+        ]
+    else:
+        target_drivers = drivers
 
-    all_records = []
-
-    for drv in drivers:
-        drv = drv.strip().upper()
-        logger.info(f"Mengekstrak data telemetri pembalap: {drv}")
-
-        # Kompatibilitas versi fastf1
-        if hasattr(session.laps, "pick_drivers"):
-            drv_laps = session.laps.pick_drivers(drv)
-        else:
-            drv_laps = session.laps.pick_driver(drv)
-
+    all_frames = []
+    for drv in target_drivers:
+        drv_laps = session.laps.pick_drivers(drv)
         if drv_laps.empty:
-            logger.warning(f"Data lap tidak ditemukan untuk pembalap {drv}. Melewati...")
             continue
 
-        if max_laps > 0:
-            drv_laps = drv_laps[drv_laps["LapNumber"] <= max_laps]
-
-        for _, lap in drv_laps.iterlaps():
+        drv_laps = drv_laps[drv_laps["LapNumber"] <= max_laps]
+        for _, lap in drv_laps.iterrows():
             try:
                 tel = lap.get_telemetry()
-            except Exception as e:
-                logger.warning(f"Gagal mengambil telemetri {drv} Lap {lap['LapNumber']}: {e}")
+                if tel.empty:
+                    continue
+
+                # Resolusi iloc[::2] (~0.5s) agar grafik dashboard halus dan tidak patah-patah
+                tel_sampled = tel.iloc[::2].copy()
+                tel_sampled["Driver"] = drv
+                tel_sampled["Team"] = sanitize_value(lap["Team"])
+                tel_sampled["LapNumber"] = sanitize_value(lap["LapNumber"])
+                tel_sampled["Compound"] = sanitize_value(lap["Compound"])
+                tel_sampled["TyreLife"] = sanitize_value(lap["TyreLife"])
+                tel_sampled["SessionTimeSec"] = tel_sampled["SessionTime"].dt.total_seconds()
+                all_frames.append(tel_sampled)
+            except Exception:
                 continue
 
-            if tel.empty:
-                continue
+    if not all_frames:
+        return pd.DataFrame()
 
-            # Ambil sampel setiap 5 baris 
-            tel_sampled = tel.iloc[::5].copy()
-
-            tel_sampled["driver"] = drv
-            tel_sampled["team"] = lap.get("Team", "Unknown")
-            tel_sampled["lap_number"] = lap.get("LapNumber", 0)
-            tel_sampled["compound"] = lap.get("Compound", "UNKNOWN")
-            tel_sampled["tyre_life"] = lap.get("TyreLife", 0)
-            tel_sampled["session_time_sec"] = tel_sampled["SessionTime"].dt.total_seconds()
-
-            all_records.append(tel_sampled)
-
-    if not all_records:
-        raise ValueError("Tidak ada data telemetri yang berhasil diekstrak.")
-
-    combined_df = pd.concat(all_records, ignore_index=True)
-    # Mengrutkan berdasarkan waktu sesi agar data kedua pembalap mengalir beriringan secara real-time
-    combined_df.sort_values(by="session_time_sec", inplace=True)
-    combined_df.reset_index(drop=True, inplace=True)
-
-    logger.info(f"Total {len(combined_df)} titik data telemetri siap di-stream.")
-    return combined_df
+    combined = pd.concat(all_frames, ignore_index=True)
+    return combined.sort_values("SessionTimeSec").reset_index(drop=True)
 
 
 def run_producer():
-    producer = create_kafka_producer(KAFKA_BOOTSTRAP_SERVERS)
-    df = extract_race_telemetry(F1_YEAR, F1_GP, F1_SESSION, DRIVERS, MAX_LAPS)
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        key_serializer=lambda k: k.encode("utf-8") if k else None,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    )
 
-    logger.info(f"Mulai menembakkan data ke topik Kafka '{KAFKA_TOPIC}' (delay: {STREAM_DELAY}s)...")
-    sent_count = 0
+    control_thread = threading.Thread(target=listen_stream_control, daemon=True)
+    control_thread.start()
 
-    try:
+    while True:
+        reload_event.clear()
+        with config_lock:
+            cfg = dict(active_config)
+
+        df = extract_race_telemetry(
+            year=cfg["filtered_year"],
+            grand_prix=cfg["grand_prix"],
+            session_type=cfg["session"],
+            drivers=cfg["drivers"],
+            max_laps=cfg["max_laps"],
+        )
+
+        if df.empty:
+            logger.warning("Data telemetri kosong untuk filter ini. Menunggu filter baru (5 detik)...")
+            reload_event.wait(timeout=5)
+            continue
+
+        logger.info(f"Streaming {len(df)} titik data ke '{KAFKA_TOPIC}'...")
         for _, row in df.iterrows():
+            # Hentikan loop balapan lama seketika jika user mengganti filter di UI
+            if reload_event.is_set():
+                logger.info("Menghentikan stream lama untuk beralih ke filter baru...")
+                break
+
             payload = {
-                # Timestamp UTC saat data dikirim (untuk timeField MongoDB Time-Series)
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "race_info": {
-                    "year": F1_YEAR,
-                    "grand_prix": F1_GP,
-                    "session": F1_SESSION,
+                    "year": cfg["filtered_year"],
+                    "grand_prix": cfg["grand_prix"],
+                    "session": cfg["session"],
                 },
-                "driver": sanitize_value(row.get("driver")),
-                "team": sanitize_value(row.get("team")),
-                "lap_number": sanitize_value(row.get("lap_number")),
-                "compound": sanitize_value(row.get("compound")),
-                "tyre_life": sanitize_value(row.get("tyre_life")),
-                "session_time_sec": sanitize_value(row.get("session_time_sec")),
+                "driver": sanitize_value(row["Driver"]),
+                "team": sanitize_value(row["Team"]),
+                "lap_number": sanitize_value(row["LapNumber"]),
+                "compound": sanitize_value(row["Compound"]),
+                "tyre_life": sanitize_value(row["TyreLife"]),
+                "session_time_sec": sanitize_value(row["SessionTimeSec"]),
                 "telemetry": {
-                    "speed": sanitize_value(row.get("Speed")),         # km/h
-                    "rpm": sanitize_value(row.get("RPM")),             # Engine RPM
-                    "gear": sanitize_value(row.get("nGear")),          # 1 - 8
-                    "throttle": sanitize_value(row.get("Throttle")),   # 0 - 100 %
-                    "brake": sanitize_value(row.get("Brake")),         # True / False
-                    "drs": sanitize_value(row.get("DRS")),             # Status DRS
-                    "distance": sanitize_value(row.get("Distance")),   # Meter dari garis start
-                    "x": sanitize_value(row.get("X")),                 # Koordinat sirkuit X
-                    "y": sanitize_value(row.get("Y")),                 # Koordinat sirkuit Y
-                    "z": sanitize_value(row.get("Z")),                 # Koordinat sirkuit Z
+                    "speed": sanitize_value(row.get("Speed")),
+                    "rpm": sanitize_value(row.get("RPM")),
+                    "gear": sanitize_value(row.get("nGear")),
+                    "throttle": sanitize_value(row.get("Throttle")),
+                    "brake": sanitize_value(row.get("Brake")),
+                    "drs": sanitize_value(row.get("DRS")),
+                    "distance": sanitize_value(row.get("Distance")),
+                    "x": sanitize_value(row.get("X")),
+                    "y": sanitize_value(row.get("Y")),
+                    "z": sanitize_value(row.get("Z")),
                 },
             }
-
-            # Gunakan kode pembalap sebagai Kafka Message Key
             producer.send(KAFKA_TOPIC, key=payload["driver"], value=payload)
-            sent_count += 1
-
-            if sent_count % 25 == 0:
-                producer.flush()
-                logger.info(
-                    f"[{sent_count}/{len(df)}] Terkirim -> Driver: {payload['driver']} | "
-                    f"Lap: {payload['lap_number']} | Speed: {payload['telemetry']['speed']} km/h | "
-                    f"Gear: {payload['telemetry']['gear']}"
-                )
-
             time.sleep(STREAM_DELAY)
-
-    except KeyboardInterrupt:
-        logger.info("Streaming dihentikan secara manual oleh pengguna (Ctrl+C).")
-    finally:
-        producer.flush()
-        producer.close()
-        logger.info(f"Producer selesai. Total pesan terkirim: {sent_count}")
 
 
 if __name__ == "__main__":

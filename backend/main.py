@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_database
-from routers import telementry
+from routers import telementry,stream_control
 
 app = FastAPI(
     title="F1 Telementry Analytics API",
@@ -18,3 +18,4 @@ app.add_middleware(
 
 db = get_database()
 app.include_router(telementry.router)
+app.include_router(stream_control.router)
